@@ -2,6 +2,12 @@
 
 Replaces the screen content of TVs in photographs with a custom overlay image. Given an input photo and a replacement image, the pipeline locates the TV screen with sub-pixel precision and composites the replacement onto it with correct perspective.
 
+## Examples
+
+| | |
+|---|---|
+| ![Living room with TV in built-in shelving](examples/1004_src.jpg) | ![Living room with wall-mounted TV](examples/1008_src.jpg) |
+
 ## How it works
 
 The pipeline runs in four stages per image:
