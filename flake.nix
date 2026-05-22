@@ -19,11 +19,6 @@
         python = pkgs.python312;
         pythonEnv = python.withPackages (python-pkgs: with python-pkgs; [
           opencv4
-          torch
-          torchvision
-          boto3
-          pillow
-          requests
           numpy
           pip
         ]);
