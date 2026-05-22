@@ -163,6 +163,178 @@ def detect_tv_body_mask(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Geometry helpers used by fit_screen_quad
+# ---------------------------------------------------------------------------
+
+def _order_quad_corners(quad: np.ndarray) -> np.ndarray:
+    """Order 4 corners as [TL, TR, BR, BL] using x+y and x-y diagonals.
+
+    Robust for any roughly axis-aligned quad; works for moderate tilts too.
+    """
+    pts = np.asarray(quad, dtype=np.float32).reshape(4, 2)
+    s = pts.sum(axis=1)
+    d = pts[:, 0] - pts[:, 1]
+    return np.array([
+        pts[np.argmin(s)],  # TL: smallest x+y
+        pts[np.argmax(d)],  # TR: largest x-y
+        pts[np.argmax(s)],  # BR: largest x+y
+        pts[np.argmin(d)],  # BL: smallest x-y
+    ], dtype=np.float32)
+
+
+def _line_through_points(p1: np.ndarray, p2: np.ndarray) -> np.ndarray | None:
+    """Return normalized line equation [a, b, c] for ax + by + c = 0."""
+    a = float(p2[1] - p1[1])
+    b = float(p1[0] - p2[0])
+    c = -(a * float(p1[0]) + b * float(p1[1]))
+    n = np.hypot(a, b)
+    if n < 1e-9:
+        return None
+    return np.array([a / n, b / n, c / n], dtype=np.float64)
+
+
+def _fit_line_tls(side_segs: np.ndarray, side_lens: np.ndarray) -> np.ndarray:
+    """Total-least-squares line fit through segment endpoints.
+
+    Returns [a, b, c] with a*x + b*y + c = 0. TLS handles vertical lines
+    cleanly (OLS would blow up on infinite slope).
+    """
+    pts = np.vstack([side_segs[:, :2], side_segs[:, 2:]]).astype(np.float64)
+    w = np.concatenate([side_lens, side_lens]).astype(np.float64) * 0.5
+    W = w.sum()
+    cx, cy = (w * pts[:, 0]).sum() / W, (w * pts[:, 1]).sum() / W
+    xs, ys = pts[:, 0] - cx, pts[:, 1] - cy
+    M = np.array([
+        [(w * xs * xs).sum(), (w * xs * ys).sum()],
+        [(w * xs * ys).sum(), (w * ys * ys).sum()],
+    ])
+    _, eigvecs = np.linalg.eigh(M)
+    vx, vy = eigvecs[:, -1]  # largest eigenvector = line direction
+    a, b = -vy, vx           # normal to direction
+    n = np.hypot(a, b)
+    a, b = a / n, b / n
+    c = -(a * cx + b * cy)
+    return np.array([a, b, c])
+
+
+def _fit_side_outer_anchored(
+    side_segs: np.ndarray,
+    side_lens: np.ndarray,
+    outer_line: np.ndarray,
+    center_pt: tuple[float, float],
+    tv_dim: float,
+    cluster_tol: float,
+    min_inset_frac: float = 0.035,
+    max_inset_frac: float = 0.22,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Pick the LONGEST cluster within a plausible bezel-thickness inset range.
+
+    For each segment we compute its perpendicular distance from ``outer_line``,
+    signed so positive = toward ``center_pt`` (i.e. inside the TV). Segments
+    are clustered by inset. Clusters outside [min_inset_frac, max_inset_frac]
+    × tv_dim are rejected:
+
+      * Below min_inset_frac: the TV outer-bezel / casing edge. With the
+        SAM-mask-derived outer_line, this is always a long, prominent cluster —
+        biasing toward "outermost" makes it always win, which is wrong.
+      * Above max_inset_frac: screen content, reflections, branding strips
+        rendered in the screen interior.
+
+    Among the surviving clusters we score by TOTAL LENGTH alone. The actual
+    bezel-to-screen transition is the longest line in the band (it spans the
+    full screen width or height); shorter content edges or partial reflections
+    lose to it by default. This is more robust than a positional bias because
+    bezel thickness varies wildly across TV models — a typical inset of "5%"
+    on a thin-bezel modern TV is "15%" on an older AQUOS with a bottom logo
+    strip, and we shouldn't tilt the score in either direction.
+    """
+    if len(side_segs) == 0:
+        return None, None
+
+    a, b, c = outer_line
+    pts_mid = np.column_stack([
+        (side_segs[:, 0] + side_segs[:, 2]) * 0.5,
+        (side_segs[:, 1] + side_segs[:, 3]) * 0.5,
+    ])
+    # Force sign convention: positive = toward TV center
+    center_sign = a * center_pt[0] + b * center_pt[1] + c
+    sgn = 1.0 if center_sign > 0 else -1.0
+    dists = sgn * (a * pts_mid[:, 0] + b * pts_mid[:, 1] + c)
+
+    # Cluster by inset distance
+    order = np.argsort(dists)
+    sorted_d = dists[order]
+    if len(order) == 1:
+        groups = [order]
+    else:
+        splits = np.where(np.diff(sorted_d) > cluster_tol)[0] + 1
+        groups = np.split(order, splits)
+
+    min_inset = min_inset_frac * tv_dim
+    max_inset = max_inset_frac * tv_dim
+
+    best, best_score = None, -np.inf
+    for g in groups:
+        total_len = float(side_lens[g].sum())
+        if total_len < 10:
+            continue
+        mean_inset = float(dists[g].mean())
+        if mean_inset < min_inset or mean_inset > max_inset:
+            continue
+        # Pure length scoring — the screen edge is the longest line in the
+        # surviving inset range by construction (it traces the full side).
+        if total_len > best_score:
+            best_score = total_len
+            best = g
+
+    if best is None or len(best) == 0:
+        return None, None
+    return _fit_line_tls(side_segs[best], side_lens[best]), best
+
+
+def _shrunken_quad(quad: np.ndarray, shrink_frac: float = 0.04) -> np.ndarray:
+    """Uniformly shrink a quad toward its centroid by ``shrink_frac`` on each side.
+
+    Used as a fallback when edge-based screen detection fails or produces an
+    implausible result. For most modern thin-bezel TVs the SAM body mask
+    closely traces the actual screen (with only a few pixels of bezel between),
+    so a small inward shrink is a reasonable approximation of the screen
+    region. Erring slightly inward is preferable to including bezel pixels:
+    "warp slightly smaller than the screen" looks like a smaller picture
+    deliberately placed inside the TV; "warp extends onto the bezel" looks
+    like a glitch.
+    """
+    pts = np.asarray(quad, dtype=np.float32).reshape(4, 2)
+    center = pts.mean(axis=0)
+    return (center + (pts - center) * (1.0 - shrink_frac)).astype(np.float32)
+
+
+def _perp_inset(p1: np.ndarray, p2: np.ndarray, outer_line: np.ndarray) -> float:
+    """Perpendicular distance from the midpoint of (p1, p2) to ``outer_line``.
+
+    Used to measure how far each side of the detected screen quad sits from
+    the corresponding side of the SAM-derived TV outer quad — i.e. the
+    effective bezel thickness on that side.
+    """
+    a, b, c = outer_line
+    mx = 0.5 * (float(p1[0]) + float(p2[0]))
+    my = 0.5 * (float(p1[1]) + float(p2[1]))
+    return abs(a * mx + b * my + c)
+
+
+class _BadEdgeQuad(Exception):
+    """Raised inside ``fit_screen_quad`` when edge-based detection produces
+    no usable quad — either no qualifying cluster was found on some side, or
+    the four sides intersected to form a quad that failed a sanity check.
+
+    Caught at the end of ``fit_screen_quad``, where the caller falls back to
+    a shrunken outer quad. We use an exception rather than ``return None`` so
+    that the many independent failure conditions in pass 2 can each abort the
+    edge-based attempt cleanly without nested control flow.
+    """
+
+
 def fit_screen_quad(
     body_mask: np.ndarray,
     input_img: np.ndarray,
@@ -177,15 +349,20 @@ def fit_screen_quad(
     Pipeline:
       1. Clean the SAM body mask (intersect with Florence-2 polygon, pick best CC).
       2. Crop to the body bbox.
-      3. Compute a local-std map; the bezel-to-screen transition shows up as a
-         rectangular ring of high-std pixels.
-      4. Canny → Hough segments on that ring.
-      5. Bucket segments into top/bottom/left/right by angle + position.
-      6. Per side, cluster co-linear segments and pick the INNERMOST cluster
-         (the screen is the innermost rectangle on the TV face).
-      7. TLS-fit a line through each chosen cluster.
-      8. Intersect adjacent sides to get four screen corners (in original-image
-         coordinates).
+      3. Fit a TV outer quad from the cleaned SAM contour. We use this as a
+         strong geometric prior for where the screen edges should lie.
+      4. Compute a directional-edge map inside a thin annular bezel band.
+      5. Canny → Hough segments on the directional channels.
+      6. Bucket segments into top/bottom/left/right.
+      7. Per side, cluster co-linear segments and pick the LONGEST cluster
+         whose inset distance from the TV outer edge falls within a plausible
+         bezel-thickness range (rejects the outer-casing transition that lives
+         at near-zero inset and screen content beyond the bezel zone).
+      8. TLS-fit a line through each chosen cluster.
+      9. Intersect adjacent sides to get four screen corners.
+     10. Sanity-check aspect ratio, side lengths, and L/R bezel symmetry.
+     11. If any pass-2 step fails (no qualifying cluster, sanity check
+         rejects), fall back to a shrunken SAM outer quad.
     """
 
     def save_debug(name: str, img: np.ndarray):
@@ -201,32 +378,26 @@ def fit_screen_quad(
     _, binary = cv2.threshold(body_mask, 127, 255, cv2.THRESH_BINARY)
 
     # Intersect with (dilated) Florence-2 polygon to clip extraneous segmentations.
-    # SAM sometimes bleeds into adjacent furniture; the Florence-2 polygon is a
-    # reliable outer bound for the TV region.
     poly_mask = np.zeros((h, w), dtype=np.uint8)
     cv2.fillPoly(poly_mask, [tv_pts.astype(np.int32)], 255)
-    poly_dilate_k = max(7, min(h, w) // 200)  # scale dilation with image size
+    poly_dilate_k = max(7, min(h, w) // 200)
     poly_mask = cv2.dilate(poly_mask, np.ones((poly_dilate_k, poly_dilate_k), np.uint8))
     binary = cv2.bitwise_and(binary, poly_mask)
 
-    # Pick the connected component most likely to be the TV body:
-    # large area + centroid close to the Florence-2 centroid
+    # Pick the connected component most likely to be the TV body
     tv_cx = float(tv_pts[:, 0].mean())
     tv_cy = float(tv_pts[:, 1].mean())
     num, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
     if num <= 1:
         return None
 
-    best_label = None
-    best_score = -float("inf")
+    best_label, best_score = None, -float("inf")
     for i in range(1, num):
         area = stats[i, cv2.CC_STAT_AREA]
-        if area < h * w * 0.0005:  # ignore tiny noise specks
+        if area < h * w * 0.0005:
             continue
         cx, cy = centroids[i]
         dist = np.hypot(cx - tv_cx, cy - tv_cy)
-        # Penalise distance proportionally to area so large off-center blobs lose to
-        # smaller on-center ones only when they're very far away
         score = area - dist * area / 100.0
         if score > best_score:
             best_score = score
@@ -236,7 +407,6 @@ def fit_screen_quad(
         return None
 
     tv_body = np.where(labels == best_label, 255, 0).astype(np.uint8)
-    # Close small holes in the mask (gaps between bezel segments, etc.)
     tv_body = cv2.morphologyEx(tv_body, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
     save_debug("10_tv_body", tv_body)
 
@@ -260,234 +430,306 @@ def fit_screen_quad(
     mask_crop = tv_body[y0:y1 + 1, x0:x1 + 1]
     save_debug("11_tv_crop", img_crop)
 
-    # ---- Local std map ----
-    # The bezel-to-screen boundary is a sharp color transition that shows up as a
-    # ring of high local standard deviation. We use boxFilter (fast integer box blur)
-    # rather than Gaussian because we only need an approximate std map.
-    gray = cv2.cvtColor(img_crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    k = max(7, min(crop_h, crop_w) // 60)  # kernel scales with crop size
-    if k % 2 == 0:
-        k += 1  # boxFilter requires odd kernel for consistent centering
-    mean_f = cv2.boxFilter(gray, ddepth=-1, ksize=(k, k))
-    mean_sq = cv2.boxFilter(gray * gray, ddepth=-1, ksize=(k, k))
-    # Var(X) = E[X²] - E[X]²; clip handles floating-point negatives near zero
-    var = np.clip(mean_sq - mean_f * mean_f, 0, None)
-    std = np.sqrt(var)
-    std_vis = np.clip(std * 4, 0, 255).astype(np.uint8)
-
-    if debug_dir is not None:
-        std_vis_dbg = std_vis.copy()
-        std_vis_dbg[mask_crop == 0] = 0  # show std only inside the TV body
-        save_debug("12_std_map", std_vis_dbg)
-
-    # ---- Canny edges ----
-    edges = cv2.Canny(std_vis, 100, 200)
-    save_debug("13_edges", edges)
-
-    # ---- Hough lines ----
-    min_dim = min(crop_h, crop_w)
-    min_line_len = max(20, min_dim // 8)   # minimum segment to register as a line
-    max_line_gap = max(5, min_dim // 40)   # maximum gap to bridge within one segment
-
-    raw = cv2.HoughLinesP(
-        edges,
-        rho=1,
-        theta=np.pi / 180,
-        threshold=40,
-        minLineLength=min_line_len,
-        maxLineGap=max_line_gap,
-    )
-    if raw is None or len(raw) < 4:
+    # ---- PASS 1: TV outer boundary from SAM mask contour ----
+    _contours, _ = cv2.findContours(mask_crop, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not _contours:
         return None
+    _tv_contour = max(_contours, key=cv2.contourArea)
+    _hull = cv2.convexHull(_tv_contour)
+    tv_outer_quad = None
+    for _eps in [0.02, 0.03, 0.05, 0.07, 0.10]:
+        _approx = cv2.approxPolyDP(_hull, _eps * cv2.arcLength(_hull, True), True)
+        if len(_approx) == 4:
+            tv_outer_quad = _approx.reshape(4, 2).astype(np.float32)
+            break
+    if tv_outer_quad is None:
+        tv_outer_quad = cv2.boxPoints(cv2.minAreaRect(_tv_contour)).astype(np.float32)
 
-    segs = raw.reshape(-1, 4).astype(np.float32)
-    dx = segs[:, 2] - segs[:, 0]
-    dy = segs[:, 3] - segs[:, 1]
-    lens = np.hypot(dx, dy)
-    # Remap angle to (-90, 90] so 0° = horizontal and ±90° = vertical
-    angles = (np.degrees(np.arctan2(dy, dx)) + 90.0) % 180.0 - 90.0
-
-    if debug_dir is not None:
-        vis = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-        for x1s, y1s, x2s, y2s in segs.astype(int):
-            cv2.line(vis, (x1s, y1s), (x2s, y2s), (0, 255, 0), 1)
-        save_debug("14_hough_raw", vis)
-
-    # ---- Bucket into top/bottom/left/right ----
-    ANGLE_HORIZ = 25.0       # ≤ this from horizontal → treat as horizontal
-    ANGLE_VERT_MIN = 65.0    # ≥ this from horizontal → treat as vertical
-    # Segments between 25° and 65° are likely perspective distortion artifacts — drop them
-    h_mask = np.abs(angles) < ANGLE_HORIZ
-    v_mask = np.abs(angles) > ANGLE_VERT_MIN
-    h_lines, h_lens = segs[h_mask], lens[h_mask]
-    v_lines, v_lens = segs[v_mask], lens[v_mask]
-    if len(h_lines) < 2 or len(v_lines) < 2:
-        return None
-
-    def weighted_median(values, weights):
-        # Length-weighted median is more robust than mean as a split point because
-        # it isn't skewed by many short noisy segments on one side
-        order = np.argsort(values)
-        v, w_ = values[order], weights[order]
-        cw = np.cumsum(w_)
-        return v[np.searchsorted(cw, cw[-1] * 0.5)]
-
-    # Split horizontal lines into top/bottom and vertical lines into left/right
-    # using the weighted median of their midpoints as the dividing line
-    h_mid_y = (h_lines[:, 1] + h_lines[:, 3]) * 0.5
-    v_mid_x = (v_lines[:, 0] + v_lines[:, 2]) * 0.5
-    split_y = weighted_median(h_mid_y, h_lens)
-    split_x = weighted_median(v_mid_x, v_lens)
-
-    sides = {
-        "top":    (h_lines[h_mid_y <  split_y], h_lens[h_mid_y <  split_y]),
-        "bottom": (h_lines[h_mid_y >= split_y], h_lens[h_mid_y >= split_y]),
-        "left":   (v_lines[v_mid_x <  split_x], v_lens[v_mid_x <  split_x]),
-        "right":  (v_lines[v_mid_x >= split_x], v_lens[v_mid_x >= split_x]),
+    # Order corners and build line equations for the four outer sides.
+    # These become the geometric anchors for per-side screen edge fitting.
+    outer_ordered = _order_quad_corners(tv_outer_quad)
+    o_tl, o_tr, o_br, o_bl = outer_ordered
+    outer_lines = {
+        "top":    _line_through_points(o_tl, o_tr),
+        "right":  _line_through_points(o_tr, o_br),
+        "bottom": _line_through_points(o_br, o_bl),
+        "left":   _line_through_points(o_bl, o_tl),
     }
-    if any(len(s[0]) == 0 for s in sides.values()):
+    if any(L is None for L in outer_lines.values()):
         return None
+    tv_w = float(np.linalg.norm(o_tr - o_tl))
+    tv_h = float(np.linalg.norm(o_bl - o_tl))
+    outer_center = ((o_tl[0] + o_br[0]) * 0.5, (o_tl[1] + o_br[1]) * 0.5)
 
-    # ---- Per-side: cluster co-linear segments, pick innermost cluster, TLS-fit ----
-    def fit_line(side_segs, side_lens):
-        """Total-least-squares line fit. Returns (a, b, c) with a*x+b*y+c=0.
-
-        TLS is used instead of ordinary least-squares because vertical lines have
-        infinite slope and would cause OLS to fail or give poor results.
-        """
-        pts = np.vstack([side_segs[:, :2], side_segs[:, 2:]]).astype(np.float64)
-        # Weight each point by its segment length so long segments pull the fit harder
-        w_ = np.concatenate([side_lens, side_lens]).astype(np.float64) * 0.5
-        W = w_.sum()
-        cx, cy = (w_ * pts[:, 0]).sum() / W, (w_ * pts[:, 1]).sum() / W
-        xs_, ys_ = pts[:, 0] - cx, pts[:, 1] - cy
-        # Build the 2×2 weighted covariance matrix; its principal eigenvector
-        # is the direction of the best-fit line
-        M = np.array([
-            [(w_ * xs_ * xs_).sum(), (w_ * xs_ * ys_).sum()],
-            [(w_ * xs_ * ys_).sum(), (w_ * ys_ * ys_).sum()],
-        ])
-        _, eigvecs = np.linalg.eigh(M)
-        vx, vy = eigvecs[:, -1]   # largest eigenvector = line direction
-        a, b = -vy, vx            # normal to the direction vector
-        n = np.hypot(a, b)
-        a, b = a / n, b / n
-        c = -(a * cx + b * cy)
-        return np.array([a, b, c])
-
-    def fit_side_innermost(side_segs, side_lens, axis, center_xy, cluster_tol):
-        """
-        Cluster segments along the perpendicular axis, then pick the cluster
-        with best (total_length / mean_distance_from_center). The screen is
-        the innermost rectangle on the TV face, so the cluster closest to the
-        center that still has substantial total length is the screen edge.
-        """
-        cx, cy = center_xy
-        if axis == "h":
-            offsets = (side_segs[:, 1] + side_segs[:, 3]) * 0.5 - cy
-        else:
-            offsets = (side_segs[:, 0] + side_segs[:, 2]) * 0.5 - cx
-
-        # Sort by offset and split into clusters wherever there's a gap > cluster_tol
-        order = np.argsort(offsets)
-        sorted_off = offsets[order]
-        if len(sorted_off) == 1:
-            groups = [order]
-        else:
-            splits = np.where(np.diff(sorted_off) > cluster_tol)[0] + 1
-            groups = np.split(order, splits)
-
-        best = None
-        best_score = -np.inf
-        for g in groups:
-            total_len = side_lens[g].sum()
-            if total_len < 10:
-                continue
-            mean_abs_off = np.abs(offsets[g]).mean()
-            # Score = total length / distance from center: prefers long segments near center
-            score = total_len / (mean_abs_off + 1.0)
-            if score > best_score:
-                best_score = score
-                best = g
-
-        if best is None or len(best) == 0:
-            return None, None
-        return fit_line(side_segs[best], side_lens[best]), best
-
-    center_xy = (crop_w * 0.5, crop_h * 0.5)
-    # Tolerance for merging nearby parallel segments into one cluster; scales with crop size
-    cluster_tol = max(4, min(crop_h, crop_w) // 50)
-
-    fits = {}
-    chosen_idx = {}  # for debug viz
-    for name, (segs_s, lens_s) in sides.items():
-        axis = "h" if name in ("top", "bottom") else "v"
-        L, idx = fit_side_innermost(segs_s, lens_s, axis, center_xy, cluster_tol)
-        if L is None:
-            return None
-        fits[name] = L
-        chosen_idx[name] = idx
-
-    # ---- Intersect adjacent sides for corners ----
-    def intersect(L1, L2):
-        """Solve the 2×2 linear system a1*x+b1*y+c1=0, a2*x+b2*y+c2=0."""
-        a1, b1, c1 = L1
-        a2, b2, c2 = L2
-        det = a1 * b2 - a2 * b1
-        if abs(det) < 1e-9:  # lines are parallel
-            return None
-        return np.array([
-            (b1 * c2 - b2 * c1) / det,
-            (a2 * c1 - a1 * c2) / det,
-        ])
-
-    tl = intersect(fits["top"],    fits["left"])
-    tr = intersect(fits["top"],    fits["right"])
-    br = intersect(fits["bottom"], fits["right"])
-    bl = intersect(fits["bottom"], fits["left"])
-    if any(c is None for c in (tl, tr, br, bl)):
-        return None
-    quad_crop = np.array([tl, tr, br, bl], dtype=np.float32)
-
-    # ---- Sanity checks ----
-    # Allow corners to fall slightly outside the crop (perspective distortion can push them)
-    slack = max(crop_h, crop_w) * 0.10
-    if (quad_crop[:, 0].min() < -slack or quad_crop[:, 0].max() > crop_w + slack or
-        quad_crop[:, 1].min() < -slack or quad_crop[:, 1].max() > crop_h + slack):
-        return None
-    # A non-convex quad means the lines crossed in the wrong order — discard
-    if not cv2.isContourConvex(quad_crop.astype(np.int32)):
-        return None
-    # Screen area should be a substantial fraction of the crop, but not exceed it
-    area = cv2.contourArea(quad_crop)
-    if area < 0.10 * crop_h * crop_w or area > 1.05 * crop_h * crop_w:
-        return None
-
-    # ---- Debug viz ----
     if debug_dir is not None:
-        vis = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-        colors = {
-            "top":    (0, 0, 255),
-            "bottom": (255, 0, 0),
-            "left":   (0, 255, 0),
-            "right":  (0, 255, 255),
+        _vis1 = img_crop.copy()
+        cv2.polylines(_vis1, [outer_ordered.astype(np.int32)], True, (0, 255, 255), 2)
+        for pt in outer_ordered.astype(int):
+            cv2.circle(_vis1, tuple(pt), 4, (0, 165, 255), -1)
+        save_debug("12_tv_outer", _vis1)
+
+    # ---- PASS 2: edge-based screen detection with graceful fallback ----
+    #
+    # Pass 2 attempts to find the bezel-to-screen transition by edge analysis
+    # within the bezel band. It has known failure modes — most notably,
+    # strong intra-screen features (window reflections, on-screen text or
+    # branding) can win the length contest against the real screen edge. The
+    # try/except machinery here lets every pass-2 failure (Hough finds
+    # nothing, no qualifying cluster on a side, sanity check fails, ...)
+    # cleanly abort the edge attempt and fall through to a shrunken outer
+    # quad. The fallback is geometrically reasonable for thin-bezel TVs and
+    # visually acceptable for thick-bezel ones — better to overlay slightly
+    # smaller than the screen than to overlay onto a reflection.
+
+    try:
+        _min_dim = min(crop_h, crop_w)
+        _outer_k = max(3, int(_min_dim * 0.02))
+        _bezel_k = max(5, int(_min_dim * 0.18))
+
+        _ek_outer = _outer_k * 2 + 1
+        _ek_bezel = _bezel_k * 2 + 1
+        _inner_from_outer = cv2.erode(mask_crop, np.ones((_ek_outer, _ek_outer), np.uint8))
+        _inner_core = cv2.erode(mask_crop, np.ones((_ek_bezel, _ek_bezel), np.uint8))
+
+        if _inner_core.any():
+            bezel_band = cv2.bitwise_and(_inner_from_outer, cv2.bitwise_not(_inner_core))
+        else:
+            bezel_band = _inner_from_outer
+
+        save_debug("13_bezel_band", bezel_band)
+
+        # Directional edge detection.
+        #
+        # IMPORTANT: compute Sobel on the UN-MASKED gray and only restrict to
+        # the bezel band AFTER Canny. Masking the gray (or the float h_map /
+        # v_map) before Canny creates a sharp synthetic step at every
+        # band-boundary pixel that Canny then picks up as a long, dense edge
+        # ring tracing the band's perimeter.
+        gray = cv2.cvtColor(img_crop, cv2.COLOR_BGR2GRAY)
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        _mag = np.sqrt(gx ** 2 + gy ** 2) + 1e-6
+        h_map = (gy * gy / _mag).astype(np.float32)
+        v_map = (gx * gx / _mag).astype(np.float32)
+
+        def _to_uint8(m: np.ndarray) -> np.ndarray:
+            m = np.clip(m, 0, None)
+            valid = m[bezel_band > 0]
+            hi = float(np.percentile(valid, 95)) if valid.size else 0.0
+            hi = max(hi, 1.0)
+            return np.clip(m * 255.0 / hi, 0, 255).astype(np.uint8)
+
+        h_edge_full = cv2.Canny(_to_uint8(h_map), 50, 150)
+        v_edge_full = cv2.Canny(_to_uint8(v_map), 50, 150)
+        h_edge = cv2.bitwise_and(h_edge_full, bezel_band)
+        v_edge = cv2.bitwise_and(v_edge_full, bezel_band)
+        edges = cv2.bitwise_or(h_edge, v_edge)
+
+        if debug_dir is not None:
+            save_debug("14_h_edge", h_edge)
+            save_debug("14_v_edge", v_edge)
+        save_debug("14_edges", edges)
+
+        # ---- Hough lines on directional channels ----
+        min_dim = min(crop_h, crop_w)
+        min_line_len = max(15, min_dim // 10)
+        max_line_gap = max(5, min_dim // 40)
+
+        _hough_kw = dict(rho=1, theta=np.pi / 180, threshold=30,
+                         minLineLength=min_line_len, maxLineGap=max_line_gap)
+        h_raw = cv2.HoughLinesP(h_edge, **_hough_kw)
+        v_raw = cv2.HoughLinesP(v_edge, **_hough_kw)
+
+        _pieces = []
+        if h_raw is not None:
+            _pieces.append(h_raw.reshape(-1, 4))
+        if v_raw is not None:
+            _pieces.append(v_raw.reshape(-1, 4))
+        if not _pieces:
+            raise _BadEdgeQuad("Hough returned no segments")
+
+        segs = np.vstack(_pieces).astype(np.float32)
+        if len(segs) < 4:
+            raise _BadEdgeQuad("fewer than 4 Hough segments total")
+
+        dx = segs[:, 2] - segs[:, 0]
+        dy = segs[:, 3] - segs[:, 1]
+        lens = np.hypot(dx, dy)
+        angles = (np.degrees(np.arctan2(dy, dx)) + 90.0) % 180.0 - 90.0
+
+        if debug_dir is not None:
+            vis = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+            for x1s, y1s, x2s, y2s in segs.astype(int):
+                cv2.line(vis, (x1s, y1s), (x2s, y2s), (0, 255, 0), 1)
+            save_debug("14_hough_raw", vis)
+
+        # ---- Bucket into top/bottom/left/right ----
+        ANGLE_HORIZ = 25.0
+        ANGLE_VERT_MIN = 65.0
+        h_mask = np.abs(angles) < ANGLE_HORIZ
+        v_mask = np.abs(angles) > ANGLE_VERT_MIN
+        h_lines, h_lens = segs[h_mask], lens[h_mask]
+        v_lines, v_lens = segs[v_mask], lens[v_mask]
+        if len(h_lines) < 2 or len(v_lines) < 2:
+            raise _BadEdgeQuad("not enough horizontal or vertical segments")
+
+        # Use the outer-quad center (a geometric constant) as the split rather
+        # than a weighted median of segment midpoints; the median migrates
+        # toward whichever side has more noise and mis-bins real edges.
+        split_y = outer_center[1]
+        split_x = outer_center[0]
+
+        h_mid_y = (h_lines[:, 1] + h_lines[:, 3]) * 0.5
+        v_mid_x = (v_lines[:, 0] + v_lines[:, 2]) * 0.5
+
+        sides = {
+            "top":    (h_lines[h_mid_y <  split_y], h_lens[h_mid_y <  split_y]),
+            "bottom": (h_lines[h_mid_y >= split_y], h_lens[h_mid_y >= split_y]),
+            "left":   (v_lines[v_mid_x <  split_x], v_lens[v_mid_x <  split_x]),
+            "right":  (v_lines[v_mid_x >= split_x], v_lens[v_mid_x >= split_x]),
         }
-        # Faint: all bucketed segments colored by side
-        for name, (g_lines, _) in sides.items():
-            for x1s, y1s, x2s, y2s in g_lines.astype(int):
-                cv2.line(vis, (x1s, y1s), (x2s, y2s), colors[name], 1)
-        # Bright white: the chosen cluster per side
-        for name, idx in chosen_idx.items():
-            g_lines = sides[name][0][idx]
-            for x1s, y1s, x2s, y2s in g_lines.astype(int):
-                cv2.line(vis, (x1s, y1s), (x2s, y2s), (255, 255, 255), 2)
-        cv2.polylines(vis, [quad_crop.astype(np.int32)], True, (255, 255, 255), 2)
-        for p in quad_crop.astype(int):
-            cv2.circle(vis, tuple(p), 4, (255, 255, 255), -1)
-        save_debug("15_screen_quad", vis)
+        if any(len(s[0]) == 0 for s in sides.values()):
+            raise _BadEdgeQuad("a side bucket has no candidate segments")
+
+        # ---- Per-side: outer-anchored cluster scoring ----
+        cluster_tol = max(4, min(crop_h, crop_w) // 50)
+        side_to_dim = {"top": tv_h, "bottom": tv_h, "left": tv_w, "right": tv_w}
+
+        fits = {}
+        chosen_idx = {}
+        for name, (segs_s, lens_s) in sides.items():
+            L, idx = _fit_side_outer_anchored(
+                segs_s, lens_s, outer_lines[name], outer_center,
+                tv_dim=side_to_dim[name], cluster_tol=cluster_tol,
+            )
+            if L is None:
+                raise _BadEdgeQuad(f"no qualifying cluster on {name}")
+            fits[name] = L
+            chosen_idx[name] = idx
+
+        # ---- Intersect adjacent sides for corners ----
+        def intersect(L1, L2):
+            a1, b1, c1 = L1
+            a2, b2, c2 = L2
+            det = a1 * b2 - a2 * b1
+            if abs(det) < 1e-9:
+                return None
+            return np.array([
+                (b1 * c2 - b2 * c1) / det,
+                (a2 * c1 - a1 * c2) / det,
+            ])
+
+        tl = intersect(fits["top"],    fits["left"])
+        tr = intersect(fits["top"],    fits["right"])
+        br = intersect(fits["bottom"], fits["right"])
+        bl = intersect(fits["bottom"], fits["left"])
+        if any(c is None for c in (tl, tr, br, bl)):
+            raise _BadEdgeQuad("adjacent sides are parallel")
+        quad_crop = np.array([tl, tr, br, bl], dtype=np.float32)
+
+        # ---- Sanity checks ----
+        slack = max(crop_h, crop_w) * 0.10
+        if (quad_crop[:, 0].min() < -slack or quad_crop[:, 0].max() > crop_w + slack or
+            quad_crop[:, 1].min() < -slack or quad_crop[:, 1].max() > crop_h + slack):
+            raise _BadEdgeQuad("quad falls outside the crop")
+        if not cv2.isContourConvex(quad_crop.astype(np.int32)):
+            raise _BadEdgeQuad("quad is non-convex")
+        area = cv2.contourArea(quad_crop)
+        if area < 0.10 * crop_h * crop_w or area > 1.05 * crop_h * crop_w:
+            raise _BadEdgeQuad(f"area out of range: {area:.0f}")
+
+        # Aspect ratio: real TVs are roughly 4:3 (1.33) to 21:9 (2.33).
+        side_top    = np.linalg.norm(quad_crop[1] - quad_crop[0])
+        side_bottom = np.linalg.norm(quad_crop[2] - quad_crop[3])
+        side_left   = np.linalg.norm(quad_crop[3] - quad_crop[0])
+        side_right  = np.linalg.norm(quad_crop[2] - quad_crop[1])
+        width_avg  = 0.5 * (side_top + side_bottom)
+        height_avg = 0.5 * (side_left + side_right)
+        if height_avg < 1.0:
+            raise _BadEdgeQuad("degenerate height")
+        aspect = width_avg / height_avg
+        if aspect < 1.20 or aspect > 2.60:
+            raise _BadEdgeQuad(f"aspect={aspect:.2f} out of [1.20, 2.60]")
+
+        # Opposite sides should be roughly equal length.
+        if min(side_top, side_bottom) / max(side_top, side_bottom) < 0.70:
+            raise _BadEdgeQuad(
+                f"top/bottom length mismatch ({side_top:.0f} vs {side_bottom:.0f})"
+            )
+        if min(side_left, side_right) / max(side_left, side_right) < 0.70:
+            raise _BadEdgeQuad(
+                f"left/right length mismatch ({side_left:.0f} vs {side_right:.0f})"
+            )
+
+        # Bezel-inset symmetry. Real screens have nearly equal left/right
+        # bezel widths, so a large L/R asymmetry is the smoking gun for one
+        # side latching onto a reflection or content edge. The failure that
+        # motivated this check: a window glare on a thin-bezel TV produced a
+        # vertical edge cluster ~20% inset from the SAM left edge. That
+        # cluster was long enough and inside the legal inset range, so it
+        # beat the real screen-left edge (which sat below min_inset_frac).
+        # The right side, with no reflection, picked the actual screen edge
+        # at ~2% inset. The resulting L/R ratio was ~10×.
+        inset_top    = _perp_inset(quad_crop[0], quad_crop[1], outer_lines["top"])
+        inset_right  = _perp_inset(quad_crop[1], quad_crop[2], outer_lines["right"])
+        inset_bottom = _perp_inset(quad_crop[2], quad_crop[3], outer_lines["bottom"])
+        inset_left   = _perp_inset(quad_crop[3], quad_crop[0], outer_lines["left"])
+
+        lr_ratio = max(inset_left, inset_right) / max(min(inset_left, inset_right), 1.0)
+        if lr_ratio > 4.0:
+            raise _BadEdgeQuad(
+                f"L/R bezel inset asymmetric (left={inset_left:.1f}, "
+                f"right={inset_right:.1f}, ratio={lr_ratio:.1f})"
+            )
+        # Top/bottom asymmetry is tolerated more generously (up to 6×) because
+        # older TVs with bottom branding strips legitimately have a much
+        # thicker bottom bezel than top.
+        tb_ratio = max(inset_top, inset_bottom) / max(min(inset_top, inset_bottom), 1.0)
+        if tb_ratio > 6.0:
+            raise _BadEdgeQuad(
+                f"T/B bezel inset asymmetric (top={inset_top:.1f}, "
+                f"bottom={inset_bottom:.1f}, ratio={tb_ratio:.1f})"
+            )
+
+        # ---- Debug viz for the edge-based success path ----
+        if debug_dir is not None:
+            vis = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+            colors = {
+                "top":    (0, 0, 255),
+                "bottom": (255, 0, 0),
+                "left":   (0, 255, 0),
+                "right":  (0, 255, 255),
+            }
+            for name, (g_lines, _) in sides.items():
+                for x1s, y1s, x2s, y2s in g_lines.astype(int):
+                    cv2.line(vis, (x1s, y1s), (x2s, y2s), colors[name], 1)
+            for name, idx in chosen_idx.items():
+                g_lines = sides[name][0][idx]
+                for x1s, y1s, x2s, y2s in g_lines.astype(int):
+                    cv2.line(vis, (x1s, y1s), (x2s, y2s), (255, 255, 255), 2)
+            cv2.polylines(vis, [quad_crop.astype(np.int32)], True, (255, 255, 255), 2)
+            for p in quad_crop.astype(int):
+                cv2.circle(vis, tuple(p), 4, (255, 255, 255), -1)
+            save_debug("15_screen_quad", vis)
+
+    except _BadEdgeQuad as exc:
+        # Fallback: SAM outer quad shrunken inward by ~4% per side. For
+        # modern thin-bezel TVs this approximates the screen tightly. For
+        # thick-bezel TVs the edge-based path normally succeeds and we don't
+        # land here; if we do, the warp will spill onto a few pixels of
+        # bezel but won't catastrophically miss like the reflection case.
+        if debug_dir is not None:
+            print(f"  [debug] edge-based screen detection failed ({exc}); "
+                  f"falling back to shrunken outer quad")
+        quad_crop = _shrunken_quad(outer_ordered, shrink_frac=0.04)
+        if debug_dir is not None:
+            vis = img_crop.copy()
+            cv2.polylines(vis, [quad_crop.astype(np.int32)], True, (0, 165, 255), 3)
+            for p in quad_crop.astype(int):
+                cv2.circle(vis, tuple(p), 4, (0, 165, 255), -1)
+            save_debug("15_screen_quad", vis)
 
     # ---- Back to original image coordinates ----
-    # quad_crop is relative to the (x0, y0) crop origin
     quad_full = quad_crop.copy()
     quad_full[:, 0] += x0
     quad_full[:, 1] += y0
@@ -503,7 +745,6 @@ def warp_and_composite(
     """Perspective-warp the overlay image onto the screen region and composite it."""
     h_in, w_in = input_img.shape[:2]
     h_ov, w_ov = overlay_img.shape[:2]
-    # Map the four overlay corners to the four detected screen corners (TL/TR/BR/BL)
     src_pts = np.float32([
         [0, 0],
         [w_ov - 1, 0],
@@ -512,7 +753,6 @@ def warp_and_composite(
     ])
     M = cv2.getPerspectiveTransform(src_pts, corners)
     warped = cv2.warpPerspective(overlay_img, M, (w_in, h_in))
-    # Use the filled screen quad mask to composite: warped inside, original outside
     _, screen_mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
     mask_3ch = cv2.merge([screen_mask, screen_mask, screen_mask])
     result = np.where(mask_3ch > 0, warped, input_img)
@@ -592,9 +832,6 @@ def process_image(
 
     if corners is None:
         logs.append("  WARNING: No usable corners, saving original image")
-        #out_path = output_dir / input_path.name
-        #cv2.imwrite(str(out_path), input_img)
-        #logs.append(f"  Saved → {out_path}")
         return True, logs
 
     logs.append(
@@ -605,7 +842,6 @@ def process_image(
         f"    {corners[3].astype(int).tolist()}"
     )
 
-    # Rasterise the detected screen quad into a mask for compositing
     screen_mask = np.zeros((h_img, w_img), dtype=np.uint8)
     cv2.fillPoly(screen_mask, [corners.astype(np.int32)], 255)
 
@@ -664,9 +900,6 @@ def main():
     print(f"Found {len(images)} image(s) to process")
 
     ok = 0
-    # Use partial to bind fixed args so each worker only receives the image path.
-    # Pool.imap_unordered yields results as workers finish (not in submission order),
-    # which keeps the main thread from blocking on slow images.
     worker = partial(
         process_image,
         output_dir=output_dir,
