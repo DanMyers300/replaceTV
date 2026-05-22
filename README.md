@@ -57,6 +57,7 @@ replaceTV/
 │   ├── detection.py        # Florence-2 and SAM 3 API calls
 │   ├── vision.py           # Screen quad detection and compositing
 │   └── pipeline.py         # Per-image orchestration
+├── examples/               # Sample source photos
 ├── download_images.py      # Fetches source images from S3
 ├── input_images/           # Source photos (TVs to process)
 ├── output_images/          # Composited results
