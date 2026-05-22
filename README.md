@@ -80,7 +80,15 @@ nix run .            # runs with default input_images/ → output_images/
 
 `fal-client` is not yet in nixpkgs; the flake installs it automatically to a local prefix on first run.
 
-### Option B: pip
+### Option B: Docker
+
+```bash
+FAL_KEY=your_key_here docker compose up
+```
+
+Input images are read from `./input_images/` and results are written to `./output_images/` on your host. The overlay (`image.jpg`) is baked into the image at build time; to use a different overlay, add `--overlay /path/to/overlay.jpg` via a `command:` override in `docker-compose.yml`.
+
+### Option C: pip
 
 ```bash
 pip install -r requirements.txt

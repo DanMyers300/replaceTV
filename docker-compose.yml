@@ -1,0 +1,8 @@
+services:
+  replacetv:
+    build: .
+    environment:
+      - FAL_KEY=${FAL_KEY}
+    volumes:
+      - ./input_images:/app/input_images
+      - ./output_images:/app/output_images
